@@ -4,40 +4,15 @@ import numpy as np
 import time
 import os
 import tensorflow as tf
-import random
-import pyttsx3
+import requests
 import threading
-import queue
+import difflib
+from dotenv import load_dotenv
 
-# ================= SAFE TEXT TO SPEECH =================
-engine = pyttsx3.init()
-engine.setProperty('rate', 150)
-engine.setProperty('volume', 1.0)
+# ================= LOAD ENV =================
+load_dotenv()
 
-speech_queue = queue.Queue()
-
-def speech_worker():
-    while True:
-        word = speech_queue.get()
-        if word is None:
-            break
-        engine.say(word)
-        engine.runAndWait()
-        speech_queue.task_done()
-
-speech_thread = threading.Thread(target=speech_worker, daemon=True)
-speech_thread.start()
-
-def speak_word(word):
-    # Clear old pending speech (speak latest only)
-    while not speech_queue.empty():
-        try:
-            speech_queue.get_nowait()
-        except:
-            break
-    speech_queue.put(word)
-
-# ================= LOAD ALPHABET MODEL =================
+# ================= LOAD MODEL =================
 MODEL_PATH = "alphabet_model.h5"
 
 if not os.path.exists(MODEL_PATH):
@@ -45,13 +20,54 @@ if not os.path.exists(MODEL_PATH):
     exit()
 
 model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-print("✅ Alphabet CNN loaded")
+print("✅ CNN Model Loaded")
 
-# ================= ANIMALS DATASET =================
-DATASET_ROOT = "Animals10"  # Adjust path if needed
-print("✅ Animals10 dataset connected")
+# ================= IMAGE GENERATION =================
+generated_image = None
+is_generating = False
 
-# ================= MediaPipe =================
+def generate_image(prompt):
+    global generated_image, is_generating
+
+    if is_generating:
+        return
+
+    is_generating = True
+    print("🚀 Generating image for:", prompt)
+
+    try:
+        url = f"https://image.pollinations.ai/prompt/{prompt}"
+        response = requests.get(url, timeout=20)
+
+        image_bytes = response.content
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is not None:
+            generated_image = cv2.resize(img, (256, 256))
+            print("✅ Image generated")
+
+    except Exception as e:
+        print("❌ Error:", e)
+
+    is_generating = False
+
+
+# ================= AUTOCORRECT =================
+def autocorrect_text(text):
+    dictionary = ["cat", "dog", "car", "tree", "house", "person", "phone", "book", "sofa"]
+
+    words = text.lower().split()
+    corrected = []
+
+    for w in words:
+        match = difflib.get_close_matches(w, dictionary, n=1)
+        corrected.append(match[0] if match else w)
+
+    return " ".join(corrected)
+
+
+# ================= MEDIAPIPE =================
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 
@@ -73,29 +89,25 @@ TOP_BAR_H = 80
 
 text_sequence = []
 last_write_time = None
-writing_now = False
-
 prev_x, prev_y = None, None
-display_image = None
 
-buttons = ["CLEAR", "BACK", "DETECT", "QUIT"]
+# 👉 SPACE CONTROL
+space_added = False
+space_start_time = None
+
+buttons = ["CLEAR", "BACK", "GENERATE", "QUIT"]
 
 # ================= HELPERS =================
 def get_fingers(lms):
     tips = [4, 8, 12, 16, 20]
-    fingers = []
-    fingers.append(lms.landmark[4].x < lms.landmark[3].x)
+    fingers = [lms.landmark[4].x < lms.landmark[3].x]
     for i in range(1, 5):
-        fingers.append(lms.landmark[tips[i]].y <
-                       lms.landmark[tips[i]-2].y)
+        fingers.append(lms.landmark[tips[i]].y < lms.landmark[tips[i]-2].y)
     return fingers
 
 def center_for_ai(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
-
-    kernel = np.ones((3, 3), np.uint8)
-    thresh = cv2.dilate(thresh, kernel, iterations=2)
 
     if np.sum(thresh) < 300:
         return None
@@ -112,45 +124,11 @@ def center_for_ai(img):
     square[(size-h)//2:(size-h)//2+h,
            (size-w)//2:(size-w)//2+w] = crop
 
-    resized = cv2.resize(square, (28, 28),
-                         interpolation=cv2.INTER_AREA)
-
+    resized = cv2.resize(square, (28, 28))
     return (resized / 255.0).reshape(1, 28, 28, 1)
 
 def idx_to_char(idx):
     return chr(ord('A') + idx)
-
-# ================= LOAD ANIMAL IMAGE =================
-def load_animal_image(word):
-    global display_image
-
-    word = word.lower().strip()
-    class_folder = os.path.join(DATASET_ROOT, word)
-
-    if not os.path.isdir(class_folder):
-        display_image = None
-        return False
-
-    images = os.listdir(class_folder)
-    if len(images) == 0:
-        display_image = None
-        return False
-
-    img_name = random.choice(images)
-    img_path = os.path.join(class_folder, img_name)
-
-    img = cv2.imread(img_path)
-    if img is None:
-        display_image = None
-        return False
-
-    # Resize proportionally (no distortion)
-    h, w, _ = img.shape
-    scale = 300 / max(h, w)
-    img = cv2.resize(img, (int(w*scale), int(h*scale)))
-
-    display_image = img
-    return True
 
 # ================= MAIN LOOP =================
 while True:
@@ -165,23 +143,16 @@ while True:
         canvas_vis = np.zeros_like(frame)
         canvas_ai = np.zeros_like(frame)
 
-    # -------- Toolbar --------
-    cv2.rectangle(frame, (0, 0), (w, TOP_BAR_H),
-                  (30, 30, 30), -1)
-
+    # TOP BAR
+    cv2.rectangle(frame, (0, 0), (w, TOP_BAR_H), (30,30,30), -1)
     btn_w = w // len(buttons)
 
     for i, name in enumerate(buttons):
-        x1 = i * btn_w
-        cv2.putText(frame, name,
-                    (x1 + 20, 45),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, (0,255,255), 2)
+        cv2.putText(frame, name, (i*btn_w+20, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
 
-    # -------- Hand Detection --------
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     res = hands.process(rgb)
-    writing_now = False
 
     if res.multi_hand_landmarks:
         lms = res.multi_hand_landmarks[0]
@@ -190,110 +161,97 @@ while True:
         x = int(lms.landmark[8].x * w)
         y = int(lms.landmark[8].y * h)
 
-        # Button Click (two fingers)
-        if y < TOP_BAR_H and fingers[1] and fingers[2]:
-            idx = x // btn_w
-            action = buttons[idx]
+        # ✋ FULL PALM = SPACE
+        if all(fingers):
+            if space_start_time is None:
+                space_start_time = time.time()
+
+            elif time.time() - space_start_time > 0.5 and not space_added:
+                text_sequence.append(" ")
+                print("Space added")
+                space_added = True
+        else:
+            space_start_time = None
+            space_added = False
+
+        # BUTTON CLICK
+        if y < TOP_BAR_H and fingers[1]:
+            action = buttons[x // btn_w]
+            print("👉 Button clicked:", action)
 
             if action == "CLEAR":
                 text_sequence.clear()
                 canvas_vis[:] = 0
                 canvas_ai[:] = 0
-                display_image = None
 
-            elif action == "BACK":
-                if text_sequence:
-                    text_sequence.pop()
+            elif action == "BACK" and text_sequence:
+                text_sequence.pop()
 
-            elif action == "DETECT":
-                word = "".join(text_sequence).strip()
-                if word:
-                    success = load_animal_image(word)
-                    if success:
-                        speak_word(word)
+            elif action == "GENERATE":
+                raw_text = "".join(text_sequence) if text_sequence else "HELLO"
+                print("Raw:", raw_text)
+
+                # ✅ Apply correction ONLY here
+                corrected = autocorrect_text(raw_text)
+                print("Corrected:", corrected)
+
+                prompt = f"A realistic image of {corrected}"
+                threading.Thread(target=generate_image, args=(prompt,)).start()
 
             elif action == "QUIT":
                 break
 
             time.sleep(0.4)
 
-        # Writing Mode
+        # DRAWING MODE
         elif fingers[1] and not fingers[2]:
-            writing_now = True
-
             if prev_x is not None:
-                cv2.line(canvas_vis,
-                         (prev_x, prev_y),
-                         (x, y),
-                         (255, 255, 255), 15)
-
-                cv2.line(canvas_ai,
-                         (prev_x, prev_y),
-                         (x, y),
-                         (255, 255, 255), 15)
+                cv2.line(canvas_vis, (prev_x, prev_y), (x, y), (255,255,255), 12)
+                cv2.line(canvas_ai, (prev_x, prev_y), (x, y), (255,255,255), 12)
 
             prev_x, prev_y = x, y
             last_write_time = time.time()
-
         else:
             prev_x, prev_y = None, None
 
-        mp_draw.draw_landmarks(frame,
-                               lms,
-                               mp_hands.HAND_CONNECTIONS)
+        mp_draw.draw_landmarks(frame, lms, mp_hands.HAND_CONNECTIONS)
 
-    # -------- Alphabet Prediction --------
-    if last_write_time and not writing_now:
-        if time.time() - last_write_time > PAUSE_TIME:
+    # LETTER DETECTION
+    if last_write_time and time.time() - last_write_time > PAUSE_TIME:
+        processed = center_for_ai(canvas_ai)
 
-            processed = center_for_ai(canvas_ai)
+        if processed is not None:
+            pred = model.predict(processed, verbose=0)[0]
+            idx = np.argmax(pred)
 
-            if processed is not None:
-                pred = model.predict(processed, verbose=0)[0]
-                idx = np.argmax(pred)
-                confidence = pred[idx]
+            if pred[idx] > CONF_THRESHOLD:
+                text_sequence.append(idx_to_char(idx))
 
-                if confidence > CONF_THRESHOLD:
-                    text_sequence.append(idx_to_char(idx))
+        last_write_time = None
+        canvas_vis[:] = 0
+        canvas_ai[:] = 0
 
-            last_write_time = None
-            canvas_vis[:] = 0
-            canvas_ai[:] = 0
-
-    # -------- Bottom Panel --------
-    cv2.rectangle(frame, (0, h-120), (w, h),
-                  (20, 20, 20), -1)
+    # DISPLAY RAW TEXT (NO CORRECTION)
+    cv2.rectangle(frame, (0, h-120), (w, h), (20,20,20), -1)
 
     word = "".join(text_sequence)
 
-    cv2.putText(frame,
-                word if word else "--",
-                (50, h-40),
-                cv2.FONT_HERSHEY_DUPLEX,
-                2.2,
-                (0, 255, 0),
-                4)
+    cv2.putText(frame, word if word else "--",
+                (50, h-40), cv2.FONT_HERSHEY_DUPLEX,
+                1.5, (0,255,0), 3)
 
-    # -------- Show Animal Image --------
-    if display_image is not None:
-        img_h, img_w, _ = display_image.shape
-        start_x = w - img_w - 20
-        start_y = 100
+    # DISPLAY IMAGE
+    if generated_image is not None:
+        frame[50:306, w-306:w-50] = generated_image
 
-        if start_y + img_h < h:
-            frame[start_y:start_y+img_h, start_x:start_x+img_w] = display_image
-
-    # -------- Overlay Pen Strokes --------
+    # DRAW OVERLAY
     gray = cv2.cvtColor(canvas_vis, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
-    frame[mask > 0] = canvas_vis[mask > 0]
+    frame[gray > 0] = canvas_vis[gray > 0]
 
-    cv2.imshow("Air Writing - Animals Detection", frame)
+    cv2.imshow("AI Scene Generator", frame)
 
     if cv2.waitKey(1) & 0xFF == 27:
         break
 
-# Cleanup
-speech_queue.put(None)
 cap.release()
 cv2.destroyAllWindows()
